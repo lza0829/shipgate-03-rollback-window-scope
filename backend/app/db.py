@@ -3,6 +3,10 @@ import sqlite3
 from contextlib import contextmanager
 from app.config import DB_PATH
 
+# 写事务等锁上限（毫秒）。两人同时回退时，第二个写者在此窗口内等待 IMMEDIATE 锁，
+# 而不是立刻报 database is locked。
+BUSY_TIMEOUT_MS = 5000
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS apps (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,6 +75,7 @@ CREATE TABLE IF NOT EXISTS rollback_windows (
   open_at TEXT NOT NULL,
   close_at TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT '窗开' CHECK(status IN ('窗开','窗关')),
+  toggled_at TEXT,
   FOREIGN KEY(env_id) REFERENCES environments(id)
 );
 CREATE TABLE IF NOT EXISTS instances (
@@ -107,14 +112,16 @@ WINDOW_STATUSES = ("窗开", "窗关")
 
 def connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     return conn
 
 
 @contextmanager
 def db():
+    """通用连接：只读或普通写都可用，异常回滚。"""
     conn = connect()
     try:
         yield conn
@@ -126,9 +133,38 @@ def db():
         conn.close()
 
 
+@contextmanager
+def tx():
+    """
+    立即写事务（BEGIN IMMEDIATE）：进入即拿库级写锁，串行化所有写者。
+    回退写口用它，保证两人同时回退不会各自 SELECT 到旧状态后写出两个目标版本。
+    整段要么一起 commit，要么异常整体 rollback，回到操作前。
+    """
+    conn = connect()
+    try:
+        # isolation_level=None 时需手动管控事务；这里显式 BEGIN IMMEDIATE。
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        yield conn
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对已存在的库做幂等的轻量列迁移。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(rollback_windows)").fetchall()}
+    if "toggled_at" not in cols:
+        conn.execute("ALTER TABLE rollback_windows ADD COLUMN toggled_at TEXT")
+
+
 def init_db() -> None:
     with db() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict | None:

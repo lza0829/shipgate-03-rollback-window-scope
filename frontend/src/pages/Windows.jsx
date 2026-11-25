@@ -47,8 +47,16 @@ export default function Windows() {
       <h2>回滚窗</h2>
       <div className="table-wrap">
         <table>
-          <thead><tr><th>环境</th><th>开启</th><th>关闭</th><th>状态</th></tr></thead>
-          <tbody>{rb.map((w) => <tr key={w.编号}><td>{w.环境}</td><td>{w.开启}</td><td>{w.关闭}</td><td>{w.状态}</td></tr>)}</tbody>
+          <thead><tr><th>环境</th><th>开启</th><th>关闭</th><th>状态</th><th>可回退(同写侧判定)</th><th>开闭戳</th></tr></thead>
+          <tbody>{rb.map((w) => (
+            <tr key={w.编号}>
+              <td>{w.环境}</td><td>{w.开启}</td><td>{w.关闭}</td><td>{w.状态}</td>
+              <td style={{ color: w.可回退 ? 'var(--ok)' : 'var(--danger)', fontWeight: 700 }}>
+                {w.可回退 ? '可写' : '关闭·写口整笔拒'}
+              </td>
+              <td>{w.开闭戳 || '-'}</td>
+            </tr>
+          ))}</tbody>
         </table>
       </div>
     </div>

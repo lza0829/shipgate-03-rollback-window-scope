@@ -2,6 +2,8 @@ from __future__ import annotations
 from datetime import datetime
 from fastapi import HTTPException
 
+from app.db import db as _db
+
 
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -97,7 +99,19 @@ def active_release_window(conn, env_id: int):
     ).fetchone()
 
 
+def latest_rollback_window(conn, env_id: int):
+    """某环境最新一条回退窗记录（无论开闭），读侧展示用。"""
+    return conn.execute(
+        """
+        SELECT * FROM rollback_windows
+        WHERE env_id=? ORDER BY id DESC LIMIT 1
+        """,
+        (env_id,),
+    ).fetchone()
+
+
 def active_rollback_window(conn, env_id: int):
+    """某环境当前开放的回退窗；无开放记录返回 None。"""
     return conn.execute(
         """
         SELECT * FROM rollback_windows
@@ -106,6 +120,42 @@ def active_rollback_window(conn, env_id: int):
         """,
         (env_id,),
     ).fetchone()
+
+
+def rollback_window_open(conn, env_id: int) -> bool:
+    """
+    回退时段写闸的【唯一谓词】。读侧（/回滚窗 的 可回退 字段）与写侧
+    （回退写口卡闸）都调用它，保证两边对「时段关闭是否还许写回退」同一判定，
+    不会出现文案说关、写口却放行的分叉。
+    """
+    return active_rollback_window(conn, env_id) is not None
+
+
+def record_rollback_rejection(release_id: int | None, env_code: str, reason: str, target: str) -> None:
+    """
+    硬闸拒绝痕迹：用【独立事务】落库，不与被回滚的主事务同生共死——
+    主事务整笔回滚后，这条「时段外回退拒因」依然可核，供审计范围过滤与对账分桶。
+    """
+    with _db() as conn:
+        conn.execute(
+            """
+            INSERT INTO audit_events(kind, ref_id, action, created_at, note)
+            VALUES ('回退拒因', ?, ?, ?, ?)
+            """,
+            (release_id, f"时段外回退拒绝·{reason}", now_str(), f"环境={env_code};目标版本={target}"),
+        )
+
+
+def record_conflict(release_id: int | None, reason: str, target: str) -> None:
+    """并发/状态冲突留痕（独立事务）。与「时段外拒因」分桶，不记成时段外日常回退。"""
+    with _db() as conn:
+        conn.execute(
+            """
+            INSERT INTO audit_events(kind, ref_id, action, created_at, note)
+            VALUES ('回退冲突', ?, ?, ?, ?)
+            """,
+            (release_id, f"回退冲突·{reason}", now_str(), f"目标版本={target}"),
+        )
 
 
 def set_app_env_version(conn, app_id: int, env_id: int, version: str) -> None:
@@ -137,6 +187,24 @@ def upsert_instance(conn, app_id: int, env_id: int, version: str, health: str, r
             """,
             (app_id, env_id, version, health, release_id, now_str()),
         )
+
+
+def converge_instances(conn, app_id: int, env_id: int, version: str, release_id: int) -> None:
+    """
+    回退收口：把该应用+环境下的【整组】实例统一到目标旧版，探针绿。
+    1) 目标版本行 upsert 为绿并挂本发版单；
+    2) 其余仍停留在新版本/其他版本的实例，整笔改写到目标旧版（而不是仅标红留残留）。
+    与名册 set_app_env_version 在同一事务内提交，杜绝「名册已旧、实例仍新」的半截分叉。
+    """
+    upsert_instance(conn, app_id, env_id, version, "探针绿", release_id)
+    conn.execute(
+        """
+        UPDATE instances
+           SET version=?, health='探针绿', release_id=?, updated_at=?
+         WHERE app_id=? AND env_id=? AND version!=?
+        """,
+        (version, release_id, now_str(), app_id, env_id, version),
+    )
 
 
 def assert_app_enabled(conn, app_id: int):
